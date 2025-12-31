@@ -2,7 +2,7 @@
 NeRV Task
 """
 from utils import *
-from losses_y import compute_loss, compute_metric, compute_regularization
+from losses_y import compute_loss, compute_metric, compute_regularization, Gauss_model
 
 
 class VideoRegressionTask:
@@ -18,6 +18,12 @@ class VideoRegressionTask:
             self.aux_loss_cfg = []
         else:
             self.aux_loss_cfg = ['1.0', args.aux_loss[0]] if len(args.aux_loss) == 1 else args.aux_loss
+        if args.mask_model == 'none':
+            self.mask_model = None
+        else:
+            kernel_size, sigma, k = args.mask_model.split('_')[1:4]
+            self.mask_model = Gauss_model(int(kernel_size), float(sigma), float(k), abs=('abs' in args.mask_model)).to(accelerator.device)
+
         self.metric_cfg = args.train_metric if training else args.eval_metric
         self.training = training
         self.enable_log_eval = enable_log_eval
@@ -58,7 +64,7 @@ class VideoRegressionTask:
 
         return output, outmask
 
-    def compute_loss(self, x, y, loss_cfg):
+    def compute_loss(self, x, y, loss_cfg, model=None):
         total_loss = None
         for i in range(len(loss_cfg) // 2):
             weight = float(loss_cfg[i * 2])
@@ -66,10 +72,10 @@ class VideoRegressionTask:
             if isinstance(x, list):
                 elem_loss = torch.tensor(0.0, device=x.device)
                 for j in range(len(x)):
-                    elem_loss += compute_loss(loss_type, x[j], y[j] if isinstance(y, list) else y)
+                    elem_loss += compute_loss(loss_type, x[j], y[j] if isinstance(y, list) else y, model)
                 loss = weight * elem_loss
             else:
-                loss = weight * compute_loss(loss_type, x, y)
+                loss = weight * compute_loss(loss_type, x, y, model)
             total_loss = total_loss + loss if total_loss is not None else loss
         return total_loss
 
@@ -85,7 +91,7 @@ class VideoRegressionTask:
         if self.training:
             targets_ycbcr = rgb_to_ycbcr(targets_rgb)
             loss = self.compute_loss(outputs, targets_ycbcr, self.loss_cfg)
-            m_loss = self.compute_loss(outmasks[-1], targets_ycbcr[:, [0]], self.mask_loss_cfg)
+            m_loss = self.compute_loss(outmasks[-1], targets_ycbcr[:, [0]], self.mask_loss_cfg, self.mask_model)
             aux_loss = self.compute_loss(outputs, targets_ycbcr, self.aux_loss_cfg)
             loss = loss + m_loss if m_loss is not None else loss
             loss = loss + aux_loss if aux_loss is not None else loss
@@ -145,6 +151,7 @@ def set_task_args(parser):
     group.add_argument('--loss', default='mse', type=str, nargs='+', help='Loss (default: "mse")')
     group.add_argument('--mask-loss', default=[], type=str, nargs='+', help='Mask Loss (default: [])')
     group.add_argument('--aux-loss', default=[], type=str, nargs='+', help='Auxiliary Loss (default: [])')
+    group.add_argument('--mask-model', default='gauss_11_5.0_20', type=str, help='Mask model (default: "gauss_11_5.0_20")')
     group.add_argument('--train-metric', default=['psnr'], type=str, nargs='+', help='Metric (default: "psnr")')
     group.add_argument('--eval-metric', default=['psnr', 'ms_ssim'], type=str, nargs='+', help='Metric (default: "psnr")')
     group.add_argument('--log-eval', type=str_to_bool, default=True, help='Log the output during evaluation.')

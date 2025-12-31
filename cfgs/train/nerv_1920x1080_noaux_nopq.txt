@@ -1,4 +1,3 @@
---loss 0.7 l1 0.3 ms-ssim_5x5
 --train-metric psnr --eval-metric psnr ms-ssim
 --crop-size -1 -1 --input-size 1080 1920 --patch-size 1 -1 -1 --cached patch
 --epochs 300 --eval-epochs 30 --log-epochs -1 --warmup-epochs 30

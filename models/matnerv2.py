@@ -358,7 +358,7 @@ class NeRVDecoder(nn.Module):
         logger.info(f'     Output channels: {self.output_channels}')
         _l_head_cfg = cfg_override(head_cfg, C1=L_C2, C2=self.output_channels // 3, Ch=max(L_C2, self.output_channels//3), kernel_size=1)
         self.l_head = get_block(**_l_head_cfg)
-        _c_head_cfg = cfg_override(head_cfg, C1=C_C2, C2=self.output_channels // 3 * 2, Ch=max(C_C2, self.output_channels//3*2), kernel_size=1, act='none')
+        _c_head_cfg = cfg_override(head_cfg, C1=C_C2, C2=self.output_channels // 3 * 2, Ch=max(C_C2, self.output_channels//3*2), kernel_size=1)
         self.c_head = get_block(**_c_head_cfg)
 
         # initialization

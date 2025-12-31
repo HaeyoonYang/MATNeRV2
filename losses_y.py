@@ -79,9 +79,9 @@ def laplacian_l1(x, y, k=20):
                                         [-1., -1., -1.]], dtype=x.dtype, device=x.device)
     kernel = kernel.view(1, 1, 3, 3).repeat(C, 1, 1, 1)
     y_lap = F.conv2d(y_reshaped, kernel, padding='same', groups=C)
-    y_lap = torch.sigmoid(y_lap * k)
+    y_lap = torch.tanh(torch.abs(y_lap) * k)
 
-    return F.l1_loss(x_reshaped, y_lap, reduction='none').view(N, T, -1).mean(dim=2)
+    return F.l1_loss(x_reshaped, y_lap.detach(), reduction='none').view(N, T, -1).mean(dim=2)
 
 
 def laplacian_mse(x, y, k=20):
@@ -104,13 +104,61 @@ def laplacian_mse(x, y, k=20):
     y_lap = F.conv2d(y_reshaped, kernel, padding='same', groups=C)
     y_lap = torch.sigmoid(y_lap * k)
 
-    return F.mse_loss(x_reshaped, y_lap, reduction='none').view(N, T, -1).mean(dim=2)
+    return F.mse_loss(x_reshaped, y_lap.detach(), reduction='none').view(N, T, -1).mean(dim=2)
 
 
-def compute_loss(name, x, y):
+def fft_l1(x, y):
+    x_fft = torch.fft.fftn(x, dim=[2,3,4])
+    y_fft = torch.fft.fftn(y, dim=[2,3,4])
+    return l1(x_fft, y_fft)
+
+
+def fft_mse(x, y):
+    x_fft = torch.fft.fftn(x, dim=[2,3,4])
+    y_fft = torch.fft.fftn(y, dim=[2,3,4])
+    return mse(x_fft, y_fft)
+
+
+def mask_loss(x, y, model, loss_type='l1'):
+    N, C, T, H, W = y.shape
+    y = y.permute(0, 2, 1, 3, 4).contiguous().view(N*T, C, H, W)
+
+    # resize y to fit the shape of x
+    h, w = x.shape[-2:]
+    if x.shape[-2:] != y.shape[-2:]:
+        y = F.interpolate(y, size=(h, w), mode='bilinear', align_corners=True)
+    y = model(y)
+    y = y.view(N, T, C, h, w).permute(0, 2, 1, 3, 4)
+    return compute_loss(loss_type, x, y.detach())
+
+
+class Gauss_model(nn.Module):
+    def __init__(self, kernel_size, sigma, k=20, abs=False):
+        super().__init__()
+        self.model_gauss = torchvision.transforms.GaussianBlur(kernel_size, sigma)
+        self.k = k
+        self.abs = abs
+
+    def forward(self, x):
+        out = x - self.model_gauss(x)
+        if self.abs:
+            out = torch.abs(torch.tanh(out * self.k))
+        else:
+            out = torch.tanh(out * self.k)
+        out = torch.clamp(x, 0, 1)
+        return out
+
+
+def compute_loss(name, x, y, model=None):
     assert x.ndim == 5 and y.ndim == 5, 'inputs are expected to have 5D ([N, C, T, H, W])'
     x, y = x.float(), y.float()
-    if name == 'mse':
+    if name == 'base':
+        return 0.7 * l1(x, y) + 0.3 * (1. - ms_ssim(x, y, win_size=5))
+    elif name == 'base_y':
+        return 0.7 * l1(x[:, [0]], y[:, [0]]) + 0.3 * (1. - ms_ssim(x[:, [0]], y[:, [0]], win_size=5))
+    elif name == 'base_cbcr':
+        return 0.7 * l1(x[:, 1:], y[:, 1:]) + 0.3 * (1. - ms_ssim(x[:, 1:], y[:, 1:], win_size=5))
+    elif name == 'mse':
         return mse(x, y)
     elif name == 'l1':
         return l1(x, y)
@@ -134,6 +182,12 @@ def compute_loss(name, x, y):
         return laplacian_l1(x, y)
     elif name == 'laplacian_mse':
         return laplacian_mse(x, y)
+    elif name == 'fft_l1':              # FFT on Y channel only
+        return fft_l1(x[:, [0]], y[:, [0]])
+    elif name == 'fft_mse':         # FFT on Y channel only
+        return fft_mse(x[:, [0]], y[:, [0]])
+    elif 'mask' in name:
+        return mask_loss(x, y, model, loss_type=name.replace('mask_', ''))
     else:
         raise ValueError
 

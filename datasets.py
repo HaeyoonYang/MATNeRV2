@@ -69,7 +69,7 @@ class VideoDataset(torch.utils.data.Dataset):
         assert isinstance(idx, int)
         img = torchvision.io.read_image(os.path.join(self.root, self.name, self.img_paths[idx]))
         img = torchvision.transforms.functional.center_crop(img, self.crop)
-        img = torchvision.transforms.functional.resize(img, self.resize, interpolation=torchvision.transforms.InterpolationMode.BICUBIC, antialias=True)
+        # img = torchvision.transforms.functional.resize(img, self.resize, interpolation=torchvision.transforms.InterpolationMode.BICUBIC, antialias=True)
         return img
 
     def load_patch(self, idx):

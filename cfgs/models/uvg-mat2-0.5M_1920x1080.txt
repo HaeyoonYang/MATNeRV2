@@ -18,4 +18,4 @@
 --l-upsample-type trilinear --l-upsample-config matmul-th-w
 --c-upsample-type dconv3x3
 --loss 1.0 base_y 0.2 base_cbcr
---mask-loss 0.01 laplacian_l1
+--mask-loss 0.01 mask_l1
