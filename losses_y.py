@@ -145,7 +145,7 @@ class Gauss_model(nn.Module):
             out = torch.abs(torch.tanh(out * self.k))
         else:
             out = torch.tanh(out * self.k)
-        out = torch.clamp(x, 0, 1)
+        out = torch.clamp(out, 0, 1)
         return out
 
 
