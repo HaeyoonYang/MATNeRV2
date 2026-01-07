@@ -550,7 +550,7 @@ class MATBlock5(nn.Module):
             # TODO
             m_in_upsampled = F.interpolate(m_in.permute(0, 4, 1, 2, 3), size=x.shape[2:4], mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
 
-        m_out = self.mask_conv(x)
+        m_out = self.mask_conv(x)           # 여기 sigmoid 해야함
 
 
 
@@ -815,9 +815,22 @@ class MATBlock_front(nn.Module):
             self.conv1.append(ConvNeXtBlock(in_features=in_features if i==0 else out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
 
         self.mask_conv = nn.Sequential(
-            Conv2d(in_features, 1, kernel_size=3, padding='same'),
+            Conv2d(in_features, in_features, kernel_size=3, padding='same', groups=in_features),
+            nn.ReLU(inplace=True),
+            Conv2d(in_features, 1, kernel_size=1, padding='same'),
             nn.Sigmoid(),
         )
+        self._initialize_maskconv()
+
+    def _initialize_maskconv(self):
+        laplacian = torch.tensor([[-1., -1., -1.],
+                                            [-1., 8., -1.],
+                                            [-1., -1., -1.]], dtype=torch.float32)
+        with torch.no_grad():
+            for i in range(self.mask_conv[0].weight.shape[0]):
+                self.mask_conv[0].weight[i, 0, :, :] = laplacian
+            
+            nn.init.constant_(self.mask_conv[2].weight, 1.0 / self.mask_conv[2].in_channels)
 
     def forward(self, idx: torch.IntTensor, x: torch.Tensor, mask=None):
         """
@@ -854,9 +867,22 @@ class MATBlock_back(nn.Module):
             self.conv1.append(ConvNeXtBlock(in_features=in_features if i==0 else out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
 
         self.mask_conv = nn.Sequential(
-            Conv2d(out_features, 1, kernel_size=3, padding='same'),
+            Conv2d(out_features, out_features, kernel_size=3, padding='same', groups=out_features),
+            nn.ReLU(inplace=True),
+            Conv2d(out_features, 1, kernel_size=1, padding='same'),
             nn.Sigmoid(),
         )
+        self._initialize_maskconv()
+
+    def _initialize_maskconv(self):
+        laplacian = torch.tensor([[-1., -1., -1.],
+                                            [-1., 8., -1.],
+                                            [-1., -1., -1.]], dtype=torch.float32)
+        with torch.no_grad():
+            for i in range(self.mask_conv[0].weight.shape[0]):
+                self.mask_conv[0].weight[i, 0, :, :] = laplacian
+            
+            nn.init.constant_(self.mask_conv[2].weight, 1.0 / self.mask_conv[2].in_channels)
 
     def forward(self, idx: torch.IntTensor, x: torch.Tensor, mask=None):
         """
@@ -987,13 +1013,6 @@ def get_block(type, **kwargs):
                              norm=kwargs['norm'], bias=kwargs['bias'],
                              layerscale_init=kwargs['layerscale'], dropout=kwargs['dropout'],
                              droppath=kwargs['droppath'], depths=kwargs['depths'])
-    elif type == 'matblock_back':
-        return MATBlock_back(in_features=kwargs['C1'], out_features=kwargs['C2'], hidden_features=kwargs['Ch'],
-                            kernel_size=kwargs['kernel_size'], act=kwargs['act'],
-                            norm=kwargs['norm'], bias=kwargs['bias'],
-                            layerscale_init=kwargs['layerscale'],
-                            dropout=kwargs['dropout'], droppath=kwargs['droppath'],
-                            depths=kwargs['depths'], mat_dimension=kwargs['mat_dim'])
     elif type == 'matblock2':
         return MATBlock2(in_features=kwargs['C1'], out_features=kwargs['C2'], hidden_features=kwargs['Ch'],
                             kernel_size=kwargs['kernel_size'], act=kwargs['act'],
