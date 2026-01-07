@@ -91,7 +91,7 @@ class VideoRegressionTask:
         if self.training:
             targets_ycbcr = rgb_to_ycbcr(targets_rgb)
             loss = self.compute_loss(outputs, targets_ycbcr, self.loss_cfg)
-            m_loss = self.compute_loss(outmasks[-1], targets_ycbcr[:, [0]], self.mask_loss_cfg, self.mask_model)
+            m_loss = self.compute_loss(outmasks[-1] if len(outmasks) > 0 else None, targets_ycbcr[:, [0]], self.mask_loss_cfg, self.mask_model)
             aux_loss = self.compute_loss(outputs, targets_ycbcr, self.aux_loss_cfg)
             loss = loss + m_loss if m_loss is not None else loss
             loss = loss + aux_loss if aux_loss is not None else loss
