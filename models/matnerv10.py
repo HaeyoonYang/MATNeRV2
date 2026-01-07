@@ -311,7 +311,7 @@ class NeRVDecoder(nn.Module):
 
             # Encoder
             _enc_cfg = get_encoding_cfg('upsample', i, size=(T2, H2, W2, C1), scale=scale, **enc_cfg)
-            if _enc_cfg['type'] != 'none+none':
+            if enc_cfg['types'][i] != 'none+none':
                 self.blocks[-1].append(PositionalEncoder(scale=scale, channels=C1, cfg=_enc_cfg))
 
             # Conv blocks
@@ -664,6 +664,7 @@ def set_args(parser):
     # Upsampling Encoders
     for prefix in ['enc']:
         group.add_argument(f'--{prefix}-type', type=str, default='normalized+temp_local_grid', help=f'type of upsampling encoding for {prefix}')
+        group.add_argument(f'--{prefix}-types', type=str, nargs='+', help=f'type of upsampling encoding for each block')
         group.add_argument(f'--{prefix}-align-corners', type=str_to_bool, default=False, help=f'compute upsampling coordinate with align corners for {prefix}')
         group.add_argument(f'--{prefix}-pe', type=float, nargs='+', default=[1.2, 60, 1.2, 60], help=f'Frequency Encoding parameters (Bt/Lt/Bs/Ls) for {prefix}')
         group.add_argument(f'--{prefix}-pe-no-t', type=str_to_bool, default=False, help=f'Do not use temporal dimension for enc encoding for {prefix}')
@@ -676,7 +677,7 @@ def set_args(parser):
     # Upsample layers
     for prefix in ['upsample']:
         group.add_argument(f'--{prefix}-type', type=str, default='trilinear', help=f'Upsampling method for {prefix}')
-        group.add_argument(f'--{prefix}-types', type=str, nargs='+', help=f'types of upsampling for each block')
+        group.add_argument(f'--{prefix}-types', type=str, nargs='+', help=f'type of upsampling for each block')
         group.add_argument(f'--{prefix}-config', type=str, default='matmul-th-w', help=f'Upsampling method config for {prefix}')
         group.add_argument(f'--{prefix}-norm', type=str, default='layernorm-no-affine', help=f'type of normalization for {prefix}')
         group.add_argument(f'--{prefix}-act', type=str, default='none', help=f'type of activation for {prefix}')

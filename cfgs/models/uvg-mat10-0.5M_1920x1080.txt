@@ -1,6 +1,6 @@
 --model MATNeRV10
---block-types none none none hinervblock
---channels 95 --channels-reduce 2.0
+--block-types identity identity identity hinervblock
+--channels 116 --channels-reduce 2.0
 --depths 1 1 1 1 --exps 4. 4. 4. 1.
 --block-mat-chans 4
 --stem-kernels 3 --kernels 3 3 3 3
@@ -9,6 +9,7 @@
 --base-grid-level-t 2 --base-grid-level-scale-t 2. 0.5
 --base-grid-level-scale-h 1. --base-grid-level-scale-w 1.
 --enc-type normalized+temp_local_grid
+--enc-types none+none none+none none+none normalized+temp_local_grid
 --enc-grid-size -1 4 --enc-grid-level 3
 --enc-grid-level-scale 2. 0.5 --enc-grid-depth-scale 1. 0.5
 --upsample-types dconv3x3 dconv3x3 dconv3x3 trilinear --upsample-config matmul-th-w
