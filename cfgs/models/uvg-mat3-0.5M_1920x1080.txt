@@ -1,5 +1,5 @@
 --model MATNeRV2
---l-block-types matblock matblock matblock matblock
+--l-block-types matblock4 matblock4 matblock4 matblock4
 --l-channels 64 --l-channels-reduce 2.0
 --l-depths 1 1 1 1 --l-exps 4. 4. 4. 1.
 --l-block-mat-chans 4
@@ -17,5 +17,4 @@
 --c-enc-type none+none
 --l-upsample-type trilinear --l-upsample-config matmul-th-w
 --c-upsample-type dconv3x3
---loss 1.0 base_y 0.2 base_cbcr
---mask-loss 0.01 mask_l1
+--loss 1.0 base_luma 0.2 base_chroma

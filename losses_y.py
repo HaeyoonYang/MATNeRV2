@@ -129,7 +129,7 @@ def mask_loss(x, y, model, loss_type='l1'):
         y = F.interpolate(y, size=(h, w), mode='bilinear', align_corners=True)
     y = model(y)
     y = y.view(N, T, C, h, w).permute(0, 2, 1, 3, 4)
-    return compute_loss(loss_type, x, y.detach())
+    return _compute_loss(loss_type, x, y.detach())
 
 
 class Gauss_model(nn.Module):
@@ -152,12 +152,21 @@ class Gauss_model(nn.Module):
 def compute_loss(name, x, y, model=None):
     assert x.ndim == 5 and y.ndim == 5, 'inputs are expected to have 5D ([N, C, T, H, W])'
     x, y = x.float(), y.float()
+    if 'luma' in name:
+        return _compute_loss(name.replace('_luma', ''), x[:, [0]], y[:, [0]], model)
+    elif 'chroma' in name:
+        return _compute_loss(name.replace('_chroma', ''), x[:, 1:], y[:, 1:], model)
+    elif 'mask' in name:
+        return mask_loss(x, y, model, loss_type=name.replace('_mask', ''))
+    else:
+        raise NotImplementedError
+
+
+def _compute_loss(name, x, y, model=None):
+    # assert x.ndim == 5 and y.ndim == 5, 'inputs are expected to have 5D ([N, C, T, H, W])'
+    # x, y = x.float(), y.float()
     if name == 'base':
         return 0.7 * l1(x, y) + 0.3 * (1. - ms_ssim(x, y, win_size=5))
-    elif name == 'base_y':
-        return 0.7 * l1(x[:, [0]], y[:, [0]]) + 0.3 * (1. - ms_ssim(x[:, [0]], y[:, [0]], win_size=5))
-    elif name == 'base_cbcr':
-        return 0.7 * l1(x[:, 1:], y[:, 1:]) + 0.3 * (1. - ms_ssim(x[:, 1:], y[:, 1:], win_size=5))
     elif name == 'mse':
         return mse(x, y)
     elif name == 'l1':
@@ -186,8 +195,6 @@ def compute_loss(name, x, y, model=None):
         return fft_l1(x[:, [0]], y[:, [0]])
     elif name == 'fft_mse':         # FFT on Y channel only
         return fft_mse(x[:, [0]], y[:, [0]])
-    elif 'mask' in name:
-        return mask_loss(x, y, model, loss_type=name.replace('mask_', ''))
     else:
         raise ValueError
 
