@@ -1,8 +1,19 @@
 """
-multi-resolution grid --> conv+ps / HiNeRV block + MAT blocks (only at last) --> out head
+                                                                --> (low-freq path) 
+multi-resolution grid --> hinerv blocks --> 
+                                                                --> (high-freq path)
 
-# Loss
-- calculating PSNR: YCbCr --> RGB and calculate PSNR
+
+# Combining low- & high-branch
+low-branch upsampling 후에 MAT로 high-branch output (1-channel mask feature) 조합
+--> upsample --> conv(d) --> MAT --> conv(d) --> head
+LHM (MAT): X_{LF} + M x X_{HF}                # No affine transform...
+or
+X_{LF} + (1 + M) x X_{HF}
+
+# output:
+    low-freq path: [N, T, H, W, C]
+    high-freq path: [N, T, H, W, 1+C]         # intermediate mask feature (w/ loss applied to it) + high-frequency feature
 """
 from .utils import *
 from .layers import *
@@ -86,23 +97,17 @@ class NeRVEncoding(nn.Module):
         self.grids = nn.ParameterList()
         self.grid_expands = nn.ModuleList()
 
-        assert len(kwargs['grid_level_scale_h']) == len(kwargs['grid_level_scale_w'])
-        self.grid_level_t = kwargs['grid_level_t']                  # temporal scale levels
-        self.grid_level_s = len(kwargs['grid_level_scale_h'])       # spatial scale levels
-        self.grid_level = self.grid_level_t * self.grid_level_s
+        self.grid_level = kwargs['grid_level']
         self.grid_sizes = []
 
         T_grid, H_grid, W_grid, C_grid = kwargs['grid_size']
-        T_scale, C_scale = kwargs['grid_level_scale_t']
-        H_scale, W_scale = kwargs['grid_level_scale_h'], kwargs['grid_level_scale_w']
+        T_scale, H_scale, W_scale, C_scale = kwargs['grid_level_scale']
 
-        for i in range(self.grid_level_s):
-            H_i, W_i = int(H_grid / H_scale[i]), int(W_grid / W_scale[i])
-            for j in range(self.grid_level_t):
-                T_i, C_i = int(T_grid / T_scale ** j), int(C_grid / C_scale ** j)
-                self.grid_sizes.append((T_i, H_i, W_i, C_i))
-                self.grids.append(FeatureGrid((T_i * H_i * W_i, C_i), init_scale=kwargs['grid_init_scale']))
-                self.grid_expands.append(GridUpsample((T, H, W)))
+        for i in range(self.grid_level):
+            T_i, H_i, W_i, C_i = int(T_grid / T_scale ** i), int(H_grid / H_scale ** i), int(W_grid / W_scale ** i), int(C_grid / C_scale ** i)
+            self.grid_sizes.append((T_i, H_i, W_i, C_i))
+            self.grids.append(FeatureGrid((T_i * H_i * W_i, C_i), init_scale=kwargs['grid_init_scale']))
+            self.grid_expands.append(GridTrilinear3D((T, H, W)))
 
     def extra_repr(self):
         s = 'size={size}, channels={channels}, grid_level={grid_level}, grid_sizes={grid_sizes}'
@@ -241,8 +246,11 @@ class NeRVDecoder(nn.Module):
     """
     NeRV Decoder, i.e., the main model layers
     """
-    def __init__(self, logger, input_size, input_channels, output_size, output_channels, 
-                 channels, channels_reduce, channels_reduce_base, channels_min, depths, exps, block_cfg, upsample_cfg, enc_cfg,kernels, scales, paddings, stem_kernels, stem_paddings, stem_cfg, head_cfg):
+    def __init__(self, logger, input_size, input_channels, output_size, output_channels,
+                 channels, channels_reduce, channels_reduce_base,
+                 channels_min, depths, exps, block_cfg,
+                 upsample_cfg, enc_cfg, kernels, scales, paddings,
+                 stem_kernels, stem_paddings, stem_cfg, head_cfg, low_cfg, high_cfg):
         super().__init__()
         assert isinstance(input_size, (tuple, list))
         assert isinstance(output_size, (tuple, list))
@@ -298,45 +306,66 @@ class NeRVDecoder(nn.Module):
                 C2 = max(divide_to_multiple(C2, self.channels_reduce, self.channels_reduce_base), self.channels_min)
 
             logger.info(f'     Stage {i + 1}:  T1 - {T1}  H1 - {H1}  W1 - {W1}  C1 - {C1}')
-            logger.info(f'                     T2 - {T2}  H2 - {H2}  W2 - {W2}  C2 - {C2}  C2 - {C2}')
+            logger.info(f'                     T2 - {T2}  H2 - {H2}  W2 - {W2}  C2 - {C2}')
             logger.info(f'                     Depth - {self.depths[i]}  Exp - {self.exps[i]}')
             logger.info(f'                     Kernel - {self.kernels[i]}  Scale - {self.scales[i]}  Padding - {self.paddings[i]}')
 
-            # Block
-            self.blocks.append(nn.ModuleList())
+            if i < len(self.scales) - 1:
+                # Block
+                self.blocks.append(nn.ModuleList())
 
-            # Upsampler
-            _upsample_cfg = cfg_override(upsample_cfg, type=upsample_cfg['types'][i], in_channels=C1, out_channels=C2, scale=scale)
-            self.blocks[-1].append(NeRVUpsampler(**_upsample_cfg))
+                # Upsampler
+                _upsample_cfg = cfg_override(upsample_cfg, type=upsample_cfg['type'], in_channels=C1, out_channels=C2, scale=scale)
+                self.blocks[-1].append(NeRVUpsampler(**_upsample_cfg))
 
-            # Encoder
-            _enc_cfg = get_encoding_cfg('upsample', i, size=(T2, H2, W2, C1), scale=scale, **enc_cfg)
-            if enc_cfg['types'][i] != 'none+none':
-                self.blocks[-1].append(PositionalEncoder(scale=scale, channels=C1, cfg=_enc_cfg))
+                # Encoder
+                _enc_cfg = get_encoding_cfg('upsample', i, size=(T2, H2, W2, C1), scale=scale, **enc_cfg)
+                if enc_cfg['type'] != 'none+none':
+                    self.blocks[-1].append(PositionalEncoder(scale=scale, channels=C1, cfg=_enc_cfg))
 
-            # Conv blocks
-            _block_cfg = cfg_override(block_cfg, type=block_cfg['types'][i], C1=C1, C2=C2, Ch=int(C2 * self.exps[i]), kernel_size=self.kernels[i], depths=self.depths[i], mat_dim=(output_size[0], block_cfg['mat_chans']))
-            self.blocks[-1].append(get_block(**_block_cfg))
+                # Conv blocks
+                _block_cfg = cfg_override(block_cfg, type=block_cfg['type'], C1=C1, C2=C2, Ch=int(C2 * self.exps[i]), kernel_size=self.kernels[i], depths=self.depths[i], mat_dim=(output_size[0], block_cfg['mat_chans']))
+                self.blocks[-1].append(get_block(**_block_cfg))
 
-        # Heads
+        # low-freq block & head
+        self.low_branch = nn.ModuleList()
+        # Upsampler
+        _upsample_cfg = cfg_override(upsample_cfg, type=low_cfg['upsample_type'], in_channels=C1, out_channels=C2, scale=scale)
+        self.low_branch.append(NeRVUpsampler(**_upsample_cfg))
+        # Encoder
+        _enc_cfg = get_encoding_cfg('upsample', i, size=(T2, H2, W2, C1), scale=scale, **enc_cfg)
+        if low_cfg['enc_type'] != 'none+none':
+            self.low_branch.append(PositionalEncoder(scale=scale, channels=C1, cfg=_enc_cfg))
+        # Conv blocks
+        _block_cfg = cfg_override(block_cfg, type=low_cfg['block_type'], C1=C1, C2=C2, Ch=int(C2 * self.exps[i]), kernel_size=self.kernels[i], depths=self.depths[i], mat_dim=(output_size[0], block_cfg['mat_chans']))
+        self.low_branch.append(get_block(**_block_cfg))
+
+        # high-freq block & head
+        self.high_branch = nn.ModuleList()
+        # Upsampler
+        _upsample_cfg = cfg_override(upsample_cfg, type=high_cfg['upsample_type'], in_channels=C1, out_channels=C2, scale=scale)
+        self.high_branch.append(NeRVUpsampler(**_upsample_cfg))
+        # Encoder
+        _enc_cfg = get_encoding_cfg('upsample', i, size=(T2, H2, W2, C1), scale=scale, **enc_cfg)
+        if high_cfg['enc_type'] != 'none+none':
+            self.high_branch.append(PositionalEncoder(scale=scale, channels=C1, cfg=_enc_cfg))
+        # Conv blocks
+        _block_cfg = cfg_override(block_cfg, type=high_cfg['block_type'], C1=C1, C2=1+C2, Ch=int(C2 * self.exps[i]), kernel_size=self.kernels[i], depths=self.depths[i], mat_dim=(output_size[0], block_cfg['mat_chans']))
+        self.high_branch.append(get_block(**_block_cfg))
+
+        # Head
         logger.info(f'     Output channels: {self.output_channels}')
-        _l_head_cfg = cfg_override(head_cfg, C1=C2, C2=self.output_channels // 3, Ch=max(C2, self.output_channels//3), kernel_size=1)
-        self.l_head = get_block(**_l_head_cfg)
-        _c_head_cfg = cfg_override(head_cfg, C1=C2, C2=self.output_channels // 3 * 2, Ch=max(C2, self.output_channels//3*2), kernel_size=1, act='none')
-        self.c_head = get_block(**_c_head_cfg)
+        _head_cfg = cfg_override(head_cfg, C1=C2, C2=self.output_channels, Ch=max(C2, self.output_channels), kernel_size=1)
+        self.head = get_block(**_head_cfg)
 
         # initialization
-        self.stem.apply(self._init_stem_blocks)
-        self.blocks.apply(self._init_stem_blocks)
-        self.l_head.apply(self._init_heads)
-        self.c_head.apply(self._init_heads)
+        self.stem.apply(self._init_blocks)
+        self.blocks.apply(self._init_blocks)
+        self.low_branch.apply(self._init_blocks)
+        self.high_branch.apply(self._init_blocks)
+        self.head.apply(self._init_blocks)
 
-    def _init_stem_blocks(self, m):
-        if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-
-    def _init_heads(self, m):
+    def _init_blocks(self, m):
         if isinstance(m, (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d)):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
@@ -344,16 +373,17 @@ class NeRVDecoder(nn.Module):
     def extra_repr(self):
         s = 'input_size={input_size}, input_channels={input_channels}, output_size={output_size}, output_channels={output_channels}'
         return s.format(**self.__dict__)
-
+    
     def get_input_padding(self, patch_mode: bool=True):
         return self.stem_paddings if patch_mode else (self.stem_paddings[0], 0, 0)
-
-    def forward(self, x: torch.Tensor, idx: torch.IntTensor, idx_max: tuple[int, int, int], patch_mode: bool=True):
+    
+    def forward(self, x: torch.Tensor, idx: torch.IntTensor, idx_max: tuple[int, int, int], gt_mask: torch.Tensor=None, patch_mode: bool=True):
         """
         Inputs:
             - x: input tensor with shape [N, T1, H1, W1, C]
             - idx: patch index tensor with shape [N, 3]
             - idx_max: list of 3 ints. Represents the range of patch indexes
+            - gt_mask: ground-truth mask feature [N, T, H, W, 1] used during training phase
             - patch_mode: if True, the input is a patch from the full video, and the faster implementation will be used
 
         Output:
@@ -371,8 +401,8 @@ class NeRVDecoder(nn.Module):
         if patch_mode:
             _, px_mask = compute_pixel_idx_3d(idx, idx_max, v_size_out, padding, clipped=False, return_mask=True)
             px_mask_3d = px_mask[0][:, :, None, None, None] \
-                            * px_mask[1][:, None, :, None, None] \
-                            * px_mask[2][:, None, None, :, None]
+                        * px_mask[1][:, None, :, None, None] \
+                        * px_mask[2][:, None, None, :, None]
         else:
             px_mask_3d = None
 
@@ -383,7 +413,6 @@ class NeRVDecoder(nn.Module):
         if px_mask_3d is not None:
             x = x * px_mask_3d
 
-        out_masks = []
         for i, block in enumerate(self.blocks):
             # update configs
             padding = self.paddings[i] if patch_mode else (self.paddings[0][0], 0, 0)
@@ -398,7 +427,7 @@ class NeRVDecoder(nn.Module):
             assert all(p_size_in_padded[d] * scale[d] >= p_size_out_padded[d] for d in range(3)), 'the input padding is too small'
 
             # Compute mask
-            # masking is only needed if kernel size > 1
+            # masking is only needed if kernel_size > 1
             if patch_mode:
                 _, px_mask = compute_pixel_idx_3d(idx, idx_max, v_size_out, padding, clipped=False, return_mask=True)
                 px_mask_3d = px_mask[0][:, :, None, None, None] \
@@ -418,26 +447,89 @@ class NeRVDecoder(nn.Module):
                               mask=px_mask_3d)
                 elif isinstance(layer, PositionalEncoder):
                     x = layer(x, idx=idx, idx_max=idx_max,
-                              size=v_size_out, 
+                              size=v_size_out,
                               scale=scale,
                               padding=padding)
                 elif isinstance(layer, nn.Identity):
                     x = layer(x)
                 else:
-                    x, mask = layer(idx[:, [0]], x, px_mask_3d)
-                    if mask is not None:
-                        out_masks.append(mask)
+                    x, _ = layer(idx[:, [0]], x, px_mask_3d)
 
-            assert_shape(x, (idx.shape[0],) + p_size_out_padded + (x.shape[-1],))
+        # update configs
+        padding = self.paddings[i] if patch_mode else (self.paddings[0][0], 0, 0)
+        scale = self.scales[i]
+        v_size_in = v_size_out
+        v_size_out = tuple(int(v_size_in[d] * scale[d]) for d in range(3))
+        p_size_in = p_size_out
+        p_size_in_padded = p_size_out_padded
+        p_size_out = tuple(int(p_size_in[d] * scale[d]) for d in range(3))
+        p_size_out_padded = tuple(p_size_out[d] + 2 * padding[d] for d in range(3))
 
-        # Head
-        l_out = self.l_head(x)
-        c_out = self.c_head(x)
-        x = torch.concat([l_out, c_out], dim=-1)
+        assert all(p_size_in_padded[d] * scale[d] >= p_size_out_padded[d] for d in range(3)), 'the input padding is too small'
+
+        # Compute mask
+        # masking is only needed if kernel_size > 1
+        if patch_mode:
+            _, px_mask = compute_pixel_idx_3d(idx, idx_max, v_size_out, padding, clipped=False, return_mask=True)
+            px_mask_3d = px_mask[0][:, :, None, None, None] \
+                            * px_mask[1][:, None, :, None, None] \
+                            * px_mask[2][:, None, None, :, None]
+        else:
+            px_mask_3d = None
+
+        # Run low-freq and high-freq branches
+        l_x, h_x = x, x
+        for _, layer in enumerate(self.high_branch):
+            if isinstance(layer, NeRVUpsampler):
+                h_x = layer(h_x, idx=idx, idx_max=idx_max,
+                          size=v_size_out,
+                          scale=scale,
+                          padding=padding,
+                          patch_mode=patch_mode,
+                          mask=px_mask_3d)
+            elif isinstance(layer, PositionalEncoder):
+                h_x = layer(h_x, idx=idx, idx_max=idx_max,
+                          size=v_size_out,
+                          scale=scale,
+                          padding=padding)
+            elif isinstance(layer, nn.Identity):
+                h_x = layer(h_x)
+            else:
+                h_x, _ = layer(idx[:, [0]], h_x, px_mask_3d)
+        out_mask = h_x[..., :1]                 # [N, T, H, W, 1] --> logits bf sigmoid
+        h_x = h_x[..., 1:]                          # [N, T, H, W, C]
+
+        if gt_mask is not None:
+            gt_mask = gt_mask.permute(0, 2, 3, 4, 1)            # [N, T, H, W, C]
+            w_x = gt_mask * h_x
+        else:
+            w_x = torch.round(torch.sigmoid(out_mask)) * h_x               # only in inference!!!
+
+        for _, layer in enumerate(self.low_branch):
+            if isinstance(layer, NeRVUpsampler):
+                l_x = layer(l_x, idx=idx, idx_max=idx_max,
+                          size=v_size_out,
+                          scale=scale,
+                          padding=padding,
+                          patch_mode=patch_mode,
+                          mask=px_mask_3d)
+            elif isinstance(layer, PositionalEncoder):
+                l_x = layer(l_x, idx=idx, idx_max=idx_max,
+                          size=v_size_out,
+                          scale=scale,
+                          padding=padding)
+            elif isinstance(layer, nn.Identity):
+                l_x = layer(l_x)
+            else:
+                l_x, _ = layer(idx[:, [0]], l_x, w_x.detach(), px_mask_3d)
+
+        # Heads
+        x = self.head(l_x)
         y = crop_tensor_nthwc(x, p_size_out)
         assert_shape(y, (idx.shape[0],) + p_size_out + (self.output_channels,))
+        out_mask = crop_tensor_nthwc(out_mask, p_size_out)
 
-        return y, out_masks
+        return y, out_mask
 
 
 class NeRV(nn.Module):
@@ -464,14 +556,15 @@ class NeRV(nn.Module):
         Inputs:
             a dictionary with {
                 - idx: patch index tensor with shape [N, 3]
-                - idx_max: list of 3 ints. Represents the range of patch indexes.
-                - video_size: list of 3 ints. Represents the size of the  full video.
-                - patch_size: list of 3 ints. Represents the size of the patch.
+                - idx_max: list of 3 ints. Represents the range of patch indexes
+                - video_size: list of 3 ints. Represents the size of the full video
+                - gt_mask: ground-truth mask feature [N, T, H, W, 1] used only in training phase, else None !!!
+                - patch_size: list of 3 ints. Represents the size of the patch
             }
         Output:
             a tensor with shape [N, C, T, H, W]
         """
-        assert all((input['patch_size'][d] % self.decoder.min_patch_size[d] == 0) for d in range(3))
+        assert all(input['patch_size'][d] % self.decoder.min_patch_size[d] == 0 for d in range(3))
         assert self.eval_patch_size is None or all(input['video_size'][d] % self.eval_patch_size[d] == 0 for d in range(3))
 
         # config
@@ -489,25 +582,25 @@ class NeRV(nn.Module):
         # Compute output
         input_padding = self.decoder.get_input_padding(patch_mode=patch_mode)
         output = self.encoding(idx, idx_max, padding=input_padding)
-        output, outmask = self.decoder(output, idx, idx_max, patch_mode=patch_mode)
+        output, out_mask = self.decoder(output, idx, idx_max, input['gt_mask'], patch_mode=patch_mode)
 
         # Reshape output
         if not self.training and self.eval_patch_size is not None:
             output = patch_to_video(output, input['patch_size'])
         output = output.permute(0, 4, 1, 2, 3).contiguous(memory_format=torch.channels_last_3d)
-        outmask = [outm.permute(0, 4, 1, 2, 3).contiguous(memory_format=torch.channels_last_3d) for outm in outmask]
+        out_mask = out_mask.permute(0, 4, 1, 2, 3).contiguous(memory_format=torch.channels_last_3d)
 
-        return output , outmask
-
+        return output, out_mask
+    
     def get_num_parameters(self):
         base_encoding_param = sum([v.numel() for _, v in self.encoding.state_dict().items()])
         decoder_param = sum([v.numel() for _, v in self.decoder.state_dict().items()])
         upsample_encoding_param = 0
-        for block in self.decoder.blocks:
+        for block in [self.decoder.blocks, self.decoder.low_branch, self.decoder.high_branch]:
             for layer in block:
                 if isinstance(block, PositionalEncoder):
                     upsample_encoding_param += sum([v.numel() for _, v in layer.state_dict().items()])
-        model_param = decoder_param - upsample_encoding_param
+        model_param = decoder_param + upsample_encoding_param
         return {
             'All': decoder_param + base_encoding_param,
             'Decoder': decoder_param,
@@ -515,7 +608,7 @@ class NeRV(nn.Module):
             'Encoding': base_encoding_param,
             'Upsampling Encoding': upsample_encoding_param,
         }
-
+    
 
 def build_encoding(args, logger, size, channels):
     # Encoding config
@@ -523,10 +616,8 @@ def build_encoding(args, logger, size, channels):
         'size': size,
         'channels': channels,
         'grid_size': args.base_grid_size,
-        'grid_level_t': args.base_grid_level_t,
-        'grid_level_scale_t': args.base_grid_level_scale_t,
-        'grid_level_scale_h': args.base_grid_level_scale_h,
-        'grid_level_scale_w': args.base_grid_level_scale_w,
+        'grid_level': args.base_grid_level,
+        'grid_level_scale': args.base_grid_level_scale,
         'grid_init_scale': args.base_grid_init_scale,
     }
 
@@ -539,7 +630,7 @@ def build_encoding(args, logger, size, channels):
 
 def build_decoder(args, logger, input_size, input_channels, output_size, output_channels):
     # Network config
-    assert len(args.depths) == len(args.exps) == len(args.kernels) == len(args.scales_t) == len(args.scales_hw) == len(args.block_types) == len(args.upsample_types)
+    assert len(args.depths) == len(args.exps) == len(args.kernels) == len(args.scales_t) == len(args.scales_hw)
     cfg = {}
     cfg['input_size'] = input_size
     cfg['input_channels'] = input_channels
@@ -558,18 +649,18 @@ def build_decoder(args, logger, input_size, input_channels, output_size, output_
     cfg['kernels'] = args.kernels
 
     if tuple(args.paddings) == (-1, -1, -1):
-        assert tuple(args.stem_paddings) == (-1, -1, -1), 'both padding must be set/not set at the same time'
-        paddings = compute_paddings(output_patchsize=(math.prod(args.scales_t), math.prod(args.scales_hw), math.prod(args.scales_hw)), scales=cfg['scales'], kernel_sizes=tuple((0, k, k) for k in cfg['kernels']), depths=cfg['depths'], resize_methods=args.upsample_type)
+        assert tuple(args.stem_paddings) == (-1, -1, -1), 'both paddings must be set/not set at the same time'
+        paddings = compute_paddings(output_patchsize=(math.prod(args.scales_t), math.prod(args.scales_hw), math.prod(args.scales_hw)), scales = cfg['scales'], kernel_sizes=tuple((0, k, k) for k in cfg['kernels']), depths=cfg['depths'], resize_methods=args.upsample_type)
         cfg['stem_paddings'] = tuple(paddings[0][d] + (0 if d == 0 else (cfg['stem_kernels'] - 1) // 2) for d in range(3))
         cfg['paddings'] = paddings[1:]
     else:
-        assert tuple(args.stem_paddings) != (-1, -1, -1), 'both padding must be set/not set at the same time'
+        assert tuple(args.stem_paddings) != (-1, -1, -1), 'both paddings must be set/not set at the same time'
         assert all(p >= 0 for p in args.stem_paddings) and all(p >= 0 for p in args.paddings)
         cfg['stem_paddings'] = args.stem_paddings
         cfg['paddings'] = [args.paddings for _ in range(len(args.depths))]
 
     # Stem/Blocks/Head/Upsampling/Encoding config
-    for prefix in ['block', 'enc', 'upsample', 'stem', 'head']:
+    for prefix in ['block', 'enc', 'upsample', 'stem', 'head', 'low', 'high']:
         cfg[f'{prefix}_cfg'] = {}
         for k, v in vars(args).items():
             if k.startswith(f'{prefix}_'):
@@ -588,9 +679,9 @@ def build_model(args, logger, input):
     args.base_size = (
         input['video_size'][0] // int(math.prod(args.scales_t)) if args.base_size[0] == -1 else args.base_size[0],
         input['video_size'][1] // int(math.prod(args.scales_hw)) if args.base_size[1] == -1 else args.base_size[1],
-        input['video_size'][2] // int(math.prod(args.scales_hw)) if args.base_size[2] == -1 else args.base_size[2]
+        input['video_size'][2] // int(math.prod(args.scales_hw)) if args.base_size[2] == -1 else args.base_size[2],
     )
-    args.base_channels = sum([int(args.base_grid_size[-1] // args.base_grid_level_scale_t[-1] ** i) for i in range(args.base_grid_level_t)] * len(args.base_grid_level_scale_h))
+    args.base_channels = sum([int(args.base_grid_size[-1] // args.base_grid_level_scale[-1] ** i) for i in range(args.base_grid_level)])
 
     # The first level grid size
     args.base_grid_size[0] = args.base_grid_size[0] if args.base_grid_size[0] != -1 else args.base_size[0]
@@ -639,10 +730,8 @@ def set_args(parser):
     for prefix in ['base']:
         group.add_argument(f'--{prefix}-size', type=int, nargs='+', default=[600, 9, 16], help='encoding size of NeRV')
         group.add_argument(f'--{prefix}-grid-size', type=int, nargs='+', default=[1, 1, 1], help=f'{prefix.title()} grid dimensions (T/H/W). The dimension of highest resolution for the multilevel case.')
-        group.add_argument(f'--{prefix}-grid-level-t', type=int, default=2, help=f'{prefix.title()} number of grid levels in temporal dimension')
-        group.add_argument(f'--{prefix}-grid-level-scale-t', type=float, nargs='+', default=[2.0, 0.5], help=f'{prefix.title()} grid scaling ratio (T/C) with the grid level.')
-        group.add_argument(f'--{prefix}-grid-level-scale-h', type=float, nargs='+', default=[1.0, 1.0, 1.0], help=f'{prefix.title()} grid scaling ratio (H) with the grid level.')
-        group.add_argument(f'--{prefix}-grid-level-scale-w', type=float, nargs='+', default=[1.0, 1.0, 1.0], help=f'{prefix.title()} grid scaling ratio (W) with the grid level.')
+        group.add_argument(f'--{prefix}-grid-level', type=int, default=2, help=f'{prefix.title()} number of grid levels')
+        group.add_argument(f'--{prefix}-grid-level-scale', type=float, nargs='+', default=[2.0, 1.0, 1.0, 0.5], help=f'{prefix.title()} grid scaling ratio (T/H/WC) with the grid level.')
         group.add_argument(f'--{prefix}-grid-init-scale', type=float, default=1e-3, help=f'{prefix.title()} grid initialization scaling factor.')
 
     # Blocks
@@ -658,13 +747,11 @@ def set_args(parser):
         group.add_argument(f'--{prefix}-dropout', type=float, default=0.0, help=f'dropout rate for {prefix}s (0.: disable)')
         group.add_argument(f'--{prefix}-droppath', type=float, default=0.0, help=f'droppath rate for {prefix}s (0.: disable)')
         group.add_argument(f'--{prefix}-bias', type=str_to_bool, default=default_bias[prefix], help=f'Use bias in blocks')
-    group.add_argument(f'--block-types', type=str, nargs='+', help=f'type of blocks')
     group.add_argument(f'--block-mat-chans', type=int, default=2, help=f'number of channels for MAT block')
 
-    # Upsampling Encoders
+    # Upsampling
     for prefix in ['enc']:
         group.add_argument(f'--{prefix}-type', type=str, default='normalized+temp_local_grid', help=f'type of upsampling encoding for {prefix}')
-        group.add_argument(f'--{prefix}-types', type=str, nargs='+', help=f'type of upsampling encoding for each block')
         group.add_argument(f'--{prefix}-align-corners', type=str_to_bool, default=False, help=f'compute upsampling coordinate with align corners for {prefix}')
         group.add_argument(f'--{prefix}-pe', type=float, nargs='+', default=[1.2, 60, 1.2, 60], help=f'Frequency Encoding parameters (Bt/Lt/Bs/Ls) for {prefix}')
         group.add_argument(f'--{prefix}-pe-no-t', type=str_to_bool, default=False, help=f'Do not use temporal dimension for enc encoding for {prefix}')
@@ -677,10 +764,18 @@ def set_args(parser):
     # Upsample layers
     for prefix in ['upsample']:
         group.add_argument(f'--{prefix}-type', type=str, default='trilinear', help=f'Upsampling method for {prefix}')
-        group.add_argument(f'--{prefix}-types', type=str, nargs='+', help=f'type of upsampling for each block')
         group.add_argument(f'--{prefix}-config', type=str, default='matmul-th-w', help=f'Upsampling method config for {prefix}')
         group.add_argument(f'--{prefix}-norm', type=str, default='layernorm-no-affine', help=f'type of normalization for {prefix}')
         group.add_argument(f'--{prefix}-act', type=str, default='none', help=f'type of activation for {prefix}')
 
     # Wrapper
     group.add_argument('--eval-patch-size', type=int, nargs='+', default=None, help='patch size during evaluation for NeRV')
+
+    # low- & high-branch
+    group.add_argument('--low-enc-type', type=str, default='none+none', help='type of upsampling encoding for low-freq branch')
+    group.add_argument('--low-upsample-type', type=str, default='trilinear', help='Upsampling method config for low-freq branch')
+    group.add_argument('--low-block-type', type=str, default='matblock_simple', help='type of block for low-freq branch')
+    group.add_argument('--high-enc-type', type=str, default='normalized+temp_local_grid', help='type of upsampling encoding for high-freq branch')
+    group.add_argument('--high-upsample-type', type=str, default='trilinear', help='Upsampling method config for high-freq branch')
+    group.add_argument('--high-block-type', type=str, default='hinervblock', help='type of block for high-freq branch')
+    group.add_argument('--high-act', type=str, default='sigmoid', help='type of activation for high-freq branch output (sigmoid / none)')

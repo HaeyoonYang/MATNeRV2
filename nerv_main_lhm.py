@@ -4,7 +4,7 @@ NeRV Training Script
 
 from utils import *
 from datasets import create_dataset, create_loader, set_dataset_args
-from nerv_tasks import VideoRegressionTask, set_task_args
+from nerv_tasks_lhm import VideoRegressionTask, set_task_args
 from nerv_compress import *
 
 from deepspeed.profiling.flops_profiler import get_model_profile
@@ -83,8 +83,10 @@ def train_step(args, logger, suffix, epoch, model, loader, optimizer, scheduler,
     model.train()
 
     accum_loss = None
+    accum_mask_loss = None
     accum_metrices = None
     reduced_loss = None
+    reduced_mask_loss = None
     reduced_metrics = None
     counts = 0
     samples = 0
@@ -96,8 +98,9 @@ def train_step(args, logger, suffix, epoch, model, loader, optimizer, scheduler,
     for i, batch in enumerate(loader):
         # Train step
         with accelerator.accumulate(model):
-            inputs, _, outputs, _, loss, metrics = task.step(model, loader, batch)
+            inputs, _, outputs, _, loss, m_loss, metrics = task.step(model, loader, batch)
             mean_loss = loss.mean()
+            mean_mask_loss = m_loss.mean() if m_loss is not None else 0.0
             mean_metrics = {k: v.mean() for k, v in metrics.items()}
 
             accelerator.backward(mean_loss)
@@ -112,9 +115,11 @@ def train_step(args, logger, suffix, epoch, model, loader, optimizer, scheduler,
 
         if i == 0:
             accum_loss = mean_loss.detach()
+            accum_mask_loss = mean_mask_loss.detach()
             accum_metrices = {k: mean_metrics[k].detach() for k in mean_metrics}
         else:
             accum_loss = accum_loss + mean_loss.detach()
+            accum_mask_loss = accum_mask_loss + mean_mask_loss.detach()
             accum_metrices = {k: accum_metrices[k] + mean_metrics[k].detach() for k in mean_metrics}
 
         counts += 1
@@ -123,12 +128,14 @@ def train_step(args, logger, suffix, epoch, model, loader, optimizer, scheduler,
         if (i + 1) % (len(loader) // 4) == 0 or (i + 1) == len(loader):
             # Accumulate loss and metrics globally
             reduced_loss = accelerator.reduce(accum_loss, reduction='mean')
+            reduced_mask_loss = accelerator.reduce(accum_mask_loss, reduction='mean')
             reduced_metrics = accelerator.reduce(accum_metrices, reduction='mean')
             # Logging loss & metrics
             log_msg = f'Train' + ('' if not suffix else f' ({suffix})') +  f' - Epoch {epoch} [{i + 1}/{len(loader)}]'
             log_msg = log_msg + f'    lr: {np.mean([group["lr"] for group in optimizer.param_groups]):.2e}'
             log_msg = log_msg + f'    img/s: {samples / (time.time() - start_time):.2f}'
             log_msg = log_msg + f'    loss: {reduced_loss.item() / counts:.4f}'
+            log_msg = log_msg + f'    mask loss: {reduced_mask_loss.item() / counts:.4f}'
             for k, v in reduced_metrics.items():
                 log_msg = log_msg + f'    {k}: {v.item() / counts:.4f}'
             logger.info(log_msg)
@@ -145,8 +152,10 @@ def eval_step(args, logger, suffix, epoch, model, loader, task, accelerator, log
     model.eval()
 
     accum_loss = None
+    accum_mask_loss = None
     accum_metrices = None
     reduced_loss = None
+    reduced_mask_loss = None
     reduced_metrics = None
     counts = 0
     samples = 0
@@ -154,15 +163,18 @@ def eval_step(args, logger, suffix, epoch, model, loader, task, accelerator, log
     for i, batch in enumerate(loader):
         # Eval step
         with torch.no_grad():
-            inputs, _, outputs, outmask, loss, metrics = task.step(model, loader, batch)
+            inputs, _, outputs, outmask, loss, m_loss, metrics = task.step(model, loader, batch)
             mean_loss = loss.mean()
+            mean_mask_loss = m_loss.mean()
             mean_metrics = {k: v.mean() for k, v in metrics.items()}
 
         if i == 0:
             accum_loss = mean_loss
+            accum_mask_loss = mean_mask_loss
             accum_metrices = {k: mean_metrics[k] for k in mean_metrics}
         else:
             accum_loss = accum_loss + mean_loss
+            accum_mask_loss = accum_mask_loss + mean_mask_loss
             accum_metrices = {k: accum_metrices[k] + mean_metrics[k] for k in mean_metrics}
 
         counts += 1
@@ -171,11 +183,13 @@ def eval_step(args, logger, suffix, epoch, model, loader, task, accelerator, log
         if (i + 1) % (len(loader) // 4) == 0 or (i + 1) == len(loader):
             # Accumulate loss and metrics globally
             reduced_loss = accelerator.reduce(accum_loss, reduction='mean')
+            reduced_mask_loss = accelerator.reduce(accum_mask_loss, reduction='mean')
             reduced_metrics = accelerator.reduce(accum_metrices, reduction='mean')
             # Logging loss & metrics
             log_msg = f'Eval' + ('' if not suffix else f' ({suffix})') +  f' - [{i + 1}/{len(loader)}]'
             log_msg = log_msg + f'    img/s: {samples / (time.time() - start_time):.2f}'
             log_msg = log_msg + f'    loss: {reduced_loss.item() / counts:.4f}'
+            log_msg = log_msg + f'    mask loss: {reduced_mask_loss.item() / counts:.4f}'
             for k, v in reduced_metrics.items():
                 log_msg = log_msg + f'    {k}: {v.item() / counts:.4f}'
             logger.info(log_msg)

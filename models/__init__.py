@@ -3,6 +3,8 @@ from . import matnerv2
 from . import matnerv3
 from . import matnerv4
 from . import matnerv10
+from . import matnerv20
+from . import matnerv21
 from . import mfnerv
 from . import mgnerv
 
@@ -15,6 +17,8 @@ model_cls = {
     'MATNeRV3': matnerv3,
     'MATNeRV4': matnerv4,
     'MATNeRV10': matnerv10,
+    'MATNeRV20': matnerv20,
+    'MATNeRV21': matnerv21,
     'MFNeRV': mfnerv,
     'MGNeRV': mgnerv,
 }

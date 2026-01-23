@@ -62,7 +62,7 @@ def ms_ssim(x, y, v_max=1., win_size=11):
     return pytorch_msssim.ms_ssim(x, y, v_max, win_size=win_size, size_average=False).view(N, T)
 
 
-def compute_loss(name, x, y):
+def compute_loss(name, x, y, model=None):
     assert x.ndim == 5 and y.ndim == 5, 'inputs are expected to have 5D ([N, C, T, H, W])'
     x, y = x.float(), y.float()
     if name == 'mse':
@@ -85,6 +85,12 @@ def compute_loss(name, x, y):
         return 1. - ms_ssim(x, y, win_size=5)
     elif name == 'ms-ssim_7x7':
         return 1. - ms_ssim(x, y, win_size=7)
+    elif 'mask' in name.lower():
+        return mask_loss(x, y, model, loss_type=name.replace('_mask', ''))
+    elif name == 'bce_logit':
+        return F.binary_cross_entropy_with_logits(x, y)
+    elif name == 'bce':
+        return F.binary_cross_entropy(x, y)
     else:
         raise ValueError
 
@@ -112,14 +118,37 @@ def compute_regularization(name, model):
 
 
 class Gauss_model(nn.Module):
-    def __init__(self, kernel_size, sigma, k=20):
+    def __init__(self, kernel_size, sigma, k=20, abs=False):
         super().__init__()
         self.model_gauss = torchvision.transforms.GaussianBlur(kernel_size, sigma)
         self.k = k
+        self.abs = abs
 
     def forward(self, x):
         out = x - self.model_gauss(x)
-        out = torch.sigmoid(out * self.k)
+        if self.abs:
+            out = torch.abs(torch.tanh(out * self.k))           # [0, 1] --> sigmoid
+        else:
+            out = torch.tanh(out * self.k)                          # [-1, 1] --> tanh
+        return out
+
+
+class Gauss_model_binary(nn.Module):
+    def __init__(self, kernel_size, sigma, k=20, abs=False):
+        super().__init__()
+        self.model_gauss = torchvision.transforms.GaussianBlur(kernel_size, sigma)
+        self.k = k
+        self.abs = abs
+
+    def forward(self, x):
+        out = x - self.model_gauss(x)
+        if self.abs:
+            out = torch.abs(torch.tanh(out * self.k))
+        else:
+            out = torch.tanh(out * self.k)
+            out = torch.clamp(out, 0., 1.)
+        
+        out = torch.round(out)              # binary (0 or 1)
         return out
 
 
@@ -135,23 +164,20 @@ def gauss_loss(x, y, gauss_model, loss_type='l1'):
 
 def mask_loss(x, y, model, loss_type='l1'):
     """
-    x: list of masks
+    x: mask image
     y: GT image
     """
     N, C, T, H, W = y.shape
     y = y.permute(0, 2, 1, 3, 4).view(N*T, C, H, W)
-    y_mean = y.mean(dim=1, keepdim=True)
+    y = y.mean(dim=1, keepdim=True)
 
-    loss = torch.tensor(0.0, device=y.device)
-    for mask in x:
-        h, w = mask.shape[-2:]
-        if mask.shape[-2:] != y_mean.shape[-2:]:
-            y_i = F.interpolate(y_mean, size=(h, w), mode='bilinear', align_corners=True)
-        else:
-            y_i = y_mean
-        y_i = model(y_i).as_strided(size=mask.size(), stride=mask.stride()).detach()
-        loss = loss + compute_loss(loss_type, mask, y_i)
-    return loss
+    # resize y to fit the shape of x
+    h, w = x.shape[-2:]
+    if x.shape[-2:] != y.shape[-2:]:
+        y = F.interpolate(y, size=(h, w), mode='bilinear', align_corners=True)
+    y = model(y)
+    y = y.view(N, T, 1, h, w).permute(0, 2, 1, 3, 4)
+    return compute_loss(loss_type, x, y.detach())
 
 
 class VGG_model(nn.Module):
