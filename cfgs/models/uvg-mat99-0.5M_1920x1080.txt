@@ -1,0 +1,16 @@
+--model MATNeRV99
+--channels 60 --channels-reduce 2.0
+--depths 2 2 2 1 --exps 4. 4. 4. 1
+--stem-kernels 3 --kernels 3 3 3 3
+--scales-hw 5 3 2 2 --stem-paddings -1 -1 -1 --paddings -1 -1 -1
+--base-size -1 -1 -1 --base-grid-size 75 -1 -1 1
+--base-grid-level-t 2 --base-grid-level-scale-t 2. 0.5
+--base-grid-level-scale-h 1. --base-grid-level-scale-w 1.
+--enc-type normalized+temp_local_grid --enc-grid-size -1 4 --enc-grid-level 3 --enc-grid-level-scale 2. 0.5 --enc-grid-depth-scale 1. 0.5 --upsample-type trilinear 
+--upsample-config matmul-th-w
+--block-mat-chans 4
+--block-types matblock4 matblock4 matblock4 matblock4
+--c-upsample-type dconv3x3 --c-upsample-act gelu
+--c-enc-type none+none --c-block-type identity
+--block-backbone-depths 2
+--loss 1.0 base_luma 1.0 base_chroma

@@ -127,6 +127,33 @@ def ycbcr_to_rgb(input):
     return torch.clamp(rgb, 0, 1)
     
 
+def rgb_to_ycocg(input):
+    """
+    input: [N, 3, T, H, W], integer
+    """
+    r, g, b = input.chunk(3, dim=1)
+
+    co = r - b
+    tmp = b + (co / 2)
+    cg = g - tmp
+    y = tmp + (cg / 2)
+
+    return torch.cat([y, co, cg], dim=1)
+
+
+def ycocg_to_rgb(input):
+    """
+    input: [N, 3, T, H, W], integer
+    """
+    y, co, cg = input.chunk(3, dim=1)
+
+    tmp = y - (cg / 2)
+    g = tmp + cg
+    b = tmp - (co / 2)
+    r = b + co
+
+    return torch.cat([r, g, b], dim=1).clamp(0, 255)
+
 
 """
 Accerlator & logger

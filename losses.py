@@ -87,10 +87,20 @@ def compute_loss(name, x, y, model=None):
         return 1. - ms_ssim(x, y, win_size=7)
     elif 'mask' in name.lower():
         return mask_loss(x, y, model, loss_type=name.replace('_mask', ''))
-    elif name == 'bce_logit':
-        return F.binary_cross_entropy_with_logits(x, y)
+    elif 'bce_logit' in name:
+        return F.binary_cross_entropy_with_logits(x, y, pos_weight=torch.tensor([float(name.split('_')[-1])], device=x.device))
     elif name == 'bce':
-        return F.binary_cross_entropy(x, y)
+        x_sigmoid = torch.sigmoid(x)
+        return F.binary_cross_entropy(x_sigmoid, y)
+    elif name == 'dice':
+        x_sigmoid = torch.sigmoid(x)
+        smooth = 1e-6
+        intersection = (x_sigmoid * y).sum()
+        dice_loss = 1 - (2. * intersection + smooth) / (x_sigmoid.sum() + y.sum() + smooth)
+        return dice_loss
+    elif 'focal' in name:
+        alpha, gamma = map(float, name.split('_')[1:])
+        return focal_loss(x, y, alpha=alpha, gamma=gamma)
     else:
         raise ValueError
 
@@ -278,3 +288,19 @@ def sobel_loss(x, y, model, loss_type='l1'):
         y_i = y_i.as_strided(size=x_i.size(), stride=x_i.stride())
         loss = compute_loss(loss_type, x_i, y_i) if loss is None else loss + compute_loss(loss_type, x_i, y_i)
     return loss
+
+
+def focal_loss(x, y, alpha=1, gamma=2):
+        """
+        alpha: weighting factor for the rare class (similar to pos_weight in BCE)
+        gamma: focusing parameter to reduce the relative loss for well-classified examples (higher gamma focuses more on hard examples)
+        """
+        ce_loss = F.binary_cross_entropy_with_logits(x, y, reduction='none')
+
+        probs = torch.sigmoid(x)
+        p_t = (y * probs) + ((1 - y) * (1 - probs))
+
+        focal_weight = (1 - p_t) ** gamma
+        loss = alpha * focal_weight * ce_loss
+
+        return loss.mean()

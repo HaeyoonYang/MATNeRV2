@@ -6,7 +6,7 @@ from utils import *
 
 def check_shape(x, y):
     assert x.shape == y.shape, 'shape of tensors must be the same!'
-    assert x.stride() == y.stride(), 'strides of tensors must be the same!'
+    # assert x.stride() == y.stride(), 'strides of tensors must be the same!'
     assert x.ndim == y.ndim == 5, 'inputs are expected to have 5D ([N, C, T, H, W])'
 
 
@@ -147,6 +147,80 @@ class Gauss_model(nn.Module):
             out = torch.tanh(out * self.k)
         out = torch.clamp(out, 0, 1)
         return out
+    
+
+class Gauss_model2(nn.Module):
+    def __init__(self, kernel_size, sigma):
+        super().__init__()
+        self.model_gauss = torchvision.transforms.GaussianBlur(kernel_size, sigma)
+
+    def forward(self, x):
+        out = x - self.model_gauss(x)
+        return out
+
+
+class Gauss_model3(nn.Module):
+    def __init__(self, kernel_size, sigma, channels=1):
+        super().__init__()
+        self.kernel_size = kernel_size
+
+        x_coord = torch.arange(kernel_size)
+        x_grid = x_coord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        center = (kernel_size - 1) / 2.
+
+        variance = sigma**2
+        gaussian_kernel = torch.exp(
+            -((x_grid - center)**2 + (y_grid - center)**2) / (2 * variance)
+        )
+        gaussian_kernel = gaussian_kernel / gaussian_kernel.sum()
+
+        kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
+
+        self.register_buffer('weight', kernel)
+        self.groups = channels
+        self.padding = kernel_size // 2
+
+    def forward(self, x):
+        blur = F.conv2d(x, self.weight, groups=self.groups, padding=self.padding)
+        return x - blur
+
+
+def model_loss(x, y, model, loss_type='l1'):
+    N, C, T, H, W = y.shape
+    x = x.permute(0, 2, 1, 3, 4).contiguous().view(N*T, C, H, W)
+    y = y.permute(0, 2, 1, 3, 4).contiguous().view(N*T, C, H, W)
+
+    x = model(x)
+    y = model(y)
+
+    x = x.view(N, T, C, H, W).permute(0, 2, 1, 3, 4)
+    y = y.view(N, T, C, H, W).permute(0, 2, 1, 3, 4)
+    return _compute_loss(loss_type, x, y.detach())
+
+
+def focal_frequency_loss(pred, target, alpha=1.0):
+    """
+    Inputs:
+        - pred: [N, C, T, H, W]
+        - target: [N, C, T, H, W]
+        - alpha: bigger the value, more focus on hard frequencies
+    """
+    pred_fft = torch.fft.fft2(pred, norm='ortho')
+    target_fft = torch.fft.fft2(target, norm='ortho')
+
+    diff = pred_fft - target_fft
+    distance = (diff.real**2 + diff.imag**2)
+
+    matrix_min = distance.view(distance.size(0), -1).min(dim=-1)[0].view(-1, 1, 1, 1)
+    matrix_max = distance.view(distance.size(0), -1).max(dim=-1)[0].view(-1, 1, 1, 1)
+    
+    weight_matrix = (distance - matrix_min) / (matrix_max - matrix_min + 1e-8)
+
+    focal_weight = weight_matrix ** alpha
+    loss = distance * focal_weight
+    
+    return loss.mean()
 
 
 def compute_loss(name, x, y, model=None):
@@ -159,7 +233,7 @@ def compute_loss(name, x, y, model=None):
     elif 'mask' in name:
         return mask_loss(x, y, model, loss_type=name.replace('_mask', ''))
     else:
-        raise NotImplementedError
+        return _compute_loss(name, x, y, model)
 
 
 def _compute_loss(name, x, y, model=None):
@@ -195,6 +269,10 @@ def _compute_loss(name, x, y, model=None):
         return fft_l1(x[:, [0]], y[:, [0]])
     elif name == 'fft_mse':         # FFT on Y channel only
         return fft_mse(x[:, [0]], y[:, [0]])
+    elif 'ffl' in name:
+        return focal_frequency_loss(x, y, alpha=float(name.replace('ffl_', '')))
+    elif 'model' in name:
+        return model_loss(x, y, model, loss_type=name.replace('_model', ''))
     else:
         raise ValueError
 

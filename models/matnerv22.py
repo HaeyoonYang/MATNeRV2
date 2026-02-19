@@ -499,11 +499,7 @@ class NeRVDecoder(nn.Module):
         out_mask = h_x[..., :1]                 # [N, T, H, W, 1] --> logits bf sigmoid
         h_x = h_x[..., 1:]                          # [N, T, H, W, C]
 
-        if gt_mask is not None:
-            gt_mask = gt_mask.permute(0, 2, 3, 4, 1)            # [N, T, H, W, C]
-            w_x = gt_mask * h_x
-        else:
-            w_x = torch.round(torch.sigmoid(out_mask)) * h_x               # only in inference!!!
+        w_x = torch.sigmoid(out_mask) * h_x
 
         for _, layer in enumerate(self.low_branch):
             if isinstance(layer, NeRVUpsampler):

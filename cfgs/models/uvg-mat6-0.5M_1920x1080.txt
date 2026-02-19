@@ -1,0 +1,14 @@
+--model MATNeRV6
+--channels 54 --channels-reduce 2.0
+--depths 3 3 3 1 --exps 4. 4. 4. 1
+--stem-kernels 3 --kernels 3 3 3 3
+--scales-hw 5 3 2 2 --stem-paddings -1 -1 -1 --paddings -1 -1 -1
+--base-size -1 -1 -1 --base-grid-size 75 -1 -1 1
+--base-grid-level 2 --base-grid-level-scale 2. 1. 1. 0.5
+--hf-enc-type normalized+temp_local_grid --lf-enc-type none+none
+--hf-enc-grid-size -1 4 --hf-enc-grid-level 3
+--hf-enc-grid-level-scale 2. 0.5 --hf-enc-grid-depth-scale 1. 0.5
+--hf-upsample-type trilinear --lf-upsample-type dconv3x3
+--hf-upsample-config matmul-th-w
+--hf-block-type hinervblock --lf-block-type identity
+--loss 0.7 l1 0.3 ms-ssim_5x5

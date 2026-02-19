@@ -253,7 +253,7 @@ class NeRVDecoder(nn.Module):
     """
     def __init__(self, logger, input_size, input_channels, output_size, output_channels, 
                  l_channels, l_channels_reduce, l_channels_reduce_base, l_channels_min, l_depths, l_exps, l_block_cfg, l_upsample_cfg, l_enc_cfg,
-                 c_channels, c_channels_reduce, c_channels_reduce_base, c_channels_min, c_depths, c_exps, c_block_cfg, c_upsample_cfg, c_enc_cfg,kernels, scales, paddings, stem_kernels, stem_paddings, stem_cfg, head_cfg):
+                 c_channels, c_channels_reduce, c_channels_reduce_base, c_channels_min, c_depths, c_exps, c_block_cfg, c_upsample_cfg, c_enc_cfg, kernels, scales, paddings, stem_kernels, stem_paddings, stem_cfg, head_cfg):
         super().__init__()
         assert isinstance(input_size, (tuple, list))
         assert isinstance(output_size, (tuple, list))
@@ -572,7 +572,7 @@ class NeRV(nn.Module):
         upsample_encoding_param = 0
         for block in [self.decoder.l_blocks, self.decoder.c_blocks]:
             for layer in block:
-                if isinstance(block, PositionalEncoder):
+                if isinstance(layer, PositionalEncoder):
                     upsample_encoding_param += sum([v.numel() for _, v in layer.state_dict().items()])
         model_param = decoder_param - upsample_encoding_param
         return {

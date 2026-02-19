@@ -100,7 +100,7 @@ def train_step(args, logger, suffix, epoch, model, loader, optimizer, scheduler,
         with accelerator.accumulate(model):
             inputs, _, outputs, _, loss, m_loss, metrics = task.step(model, loader, batch)
             mean_loss = loss.mean()
-            mean_mask_loss = m_loss.mean() if m_loss is not None else 0.0
+            mean_mask_loss = m_loss.mean() if m_loss is not None else torch.tensor(0.0, device=loss.device)
             mean_metrics = {k: v.mean() for k, v in metrics.items()}
 
             accelerator.backward(mean_loss)
@@ -165,7 +165,7 @@ def eval_step(args, logger, suffix, epoch, model, loader, task, accelerator, log
         with torch.no_grad():
             inputs, _, outputs, outmask, loss, m_loss, metrics = task.step(model, loader, batch)
             mean_loss = loss.mean()
-            mean_mask_loss = m_loss.mean()
+            mean_mask_loss = m_loss.mean() if m_loss is not None else torch.tensor(0.0, device=loss.device)
             mean_metrics = {k: v.mean() for k, v in metrics.items()}
 
         if i == 0:

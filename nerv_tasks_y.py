@@ -2,7 +2,7 @@
 NeRV Task
 """
 from utils import *
-from losses_y import compute_loss, compute_metric, compute_regularization, Gauss_model
+from losses_y import compute_loss, compute_metric, compute_regularization, Gauss_model2
 
 
 class VideoRegressionTask:
@@ -21,8 +21,8 @@ class VideoRegressionTask:
         if args.mask_model == 'none':
             self.mask_model = None
         else:
-            kernel_size, sigma, k = args.mask_model.split('_')[1:4]
-            self.mask_model = Gauss_model(int(kernel_size), float(sigma), float(k), abs=('abs' in args.mask_model)).to(accelerator.device)
+            kernel_size, sigma = args.mask_model.split('_')[1:3]
+            self.mask_model = Gauss_model2(int(kernel_size), float(sigma)).to(accelerator.device)
 
         self.metric_cfg = args.train_metric if training else args.eval_metric
         self.training = training
@@ -42,6 +42,9 @@ class VideoRegressionTask:
         assert idx.ndim == 2, 'idx should have 2 dimensions with shape [N, 3], where each row is the 3D patch coordinate'
         assert x.ndim == 5,  'x should have 5 dimensions with shape [N, C, T, H, W], where each sample is a 3D patch'
 
+        x_ycocg = torch.round(x * 255.)
+        x_ycocg = rgb_to_ycocg(x_ycocg) / 255.
+
         input = {
             'x': x if self.training else None,
             'idx': idx, 
@@ -51,9 +54,10 @@ class VideoRegressionTask:
             'patch_size': loader.dataset.patch_size
         }
 
-        target = x
+        target_rgb = x
+        target_ycocg = x_ycocg
 
-        return input, target
+        return input, target_rgb, target_ycocg
 
     def parse_output(self, loader, batch):
         """
@@ -86,20 +90,23 @@ class VideoRegressionTask:
         return metrics
 
     def step(self, model, loader, batch):
-        inputs, targets_rgb = self.parse_input(loader, batch)
+        inputs, targets_rgb, targets_ycocg = self.parse_input(loader, batch)
         outputs, outmasks = self.parse_output(loader, model(inputs))
         if self.training:
-            targets_ycbcr = rgb_to_ycbcr(targets_rgb)
-            loss = self.compute_loss(outputs, targets_ycbcr, self.loss_cfg)
-            m_loss = self.compute_loss(outmasks[-1] if len(outmasks) > 0 else None, targets_ycbcr[:, [0]], self.mask_loss_cfg, self.mask_model)
-            aux_loss = self.compute_loss(outputs, targets_ycbcr, self.aux_loss_cfg)
+            loss = self.compute_loss(outputs, targets_ycocg, self.loss_cfg)
+            m_loss = self.compute_loss(outmasks[-1] if len(outmasks) > 0 else None, targets_ycocg[:, [0]], self.mask_loss_cfg, self.mask_model)
+            aux_loss = self.compute_loss(outputs, targets_ycocg, self.aux_loss_cfg, self.mask_model)
             loss = loss + m_loss if m_loss is not None else loss
             loss = loss + aux_loss if aux_loss is not None else loss
         else:
             loss = torch.tensor(0.0, device=outputs.device)
-        outputs_rgb = ycbcr_to_rgb(outputs)
+            m_loss = torch.tensor(0.0, device=outputs.device)
+
+        # compute metrics
+        outputs_rgb = torch.round(outputs * 255.)
+        outputs_rgb = ycocg_to_rgb(outputs_rgb) / 255.
         metrics = self.compute_metrics(outputs_rgb, targets_rgb)
-        return inputs, targets_rgb, outputs_rgb, None if outmasks==[] else outmasks[-1], loss, metrics
+        return inputs, targets_rgb, outputs_rgb, None if outmasks==[] else outmasks[-1], loss, m_loss, metrics
 
     def log_eval(self, dir_name, inputs, outputs, metrics, outmask=None):
         """

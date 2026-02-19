@@ -1,0 +1,21 @@
+--model MATNeRV2
+--l-block-types matblock4_2 matblock4_2 matblock4_2 matblock4_2
+--l-channels 60 --l-channels-reduce 2.0
+--l-depths 2 2 2 1 --l-exps 4. 4. 4. 1.
+--l-block-mat-chans 4
+--c-block-types identity identity identity identity
+--c-channels 36 --c-channels-reduce 2.0
+--c-depths 1 1 1 1 --c-exps 1. 1. 1. 1.
+--stem-kernels 3 --kernels 3 3 3 3
+--scales-hw 5 3 2 2 --stem-paddings -1 -1 -1 --paddings -1 -1 -1
+--base-size -1 -1 -1 --base-grid-size 75 -1 -1 1
+--base-grid-level-t 2 --base-grid-level-scale-t 2. 0.5
+--base-grid-level-scale-h 1. --base-grid-level-scale-w 1.
+--l-enc-type normalized+temp_local_grid
+--l-enc-grid-size -1 4 --l-enc-grid-level 3
+--l-enc-grid-level-scale 2. 0.5 --l-enc-grid-depth-scale 1. 0.5
+--c-enc-type none+none
+--l-upsample-type trilinear --l-upsample-config matmul-th-w
+--c-upsample-type dconv3x3
+--loss 1.0 base_luma 0.2 base_chroma
+--mask-loss 0.01 mse_mask

@@ -1,8 +1,10 @@
 """
 Shared Layers - all assume 5D inputs
 """
+import torchvision.transforms.functional
 from .utils import *
 from timm.models.layers import DropPath
+import torchvision
 
 
 """
@@ -67,6 +69,47 @@ class AdaptiveAvgPool2d(nn.AdaptiveAvgPool2d):
         x = x.permute(0, 2, 3, 1).view(N, T, self.output_size, self.output_size, C)
         return x
 
+
+class Conv2d_kernel(nn.Module):
+    def __init__(self, in_channels, kernel, stride=1, padding=1, dilation=1):
+        super().__init__()
+
+        if kernel.dim() == 2:
+            kernel = kernel.view(1, 1, kernel.size(0), kernel.size(1))
+        
+        kernel = kernel.repeat(in_channels, 1, 1, 1)
+        self.register_buffer('weight', kernel)
+
+        self.in_channels = in_channels
+        self.stride = stride
+        self.padding = padding
+        self.dilation = dilation
+        self.groups = in_channels
+        self.bias = None
+
+    def forward(self, input):
+        N, T, H, W, _ = input.shape
+        x = input.view(N * T, H, W, -1).permute(0, 3, 1, 2)
+        x = F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+        x = x.permute(0, 2, 3, 1).view(N, T, H, W, -1)
+        return x
+
+
+class Gaussian_kernel(nn.Module):
+    def __init__(self, kernel_size, sigma):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+
+    def forward(self, input):
+        N, T, H, W, _ = input.shape
+        x = input.view(N * T, H, W, -1).permute(0, 3, 1, 2)
+        lf_x = torchvision.transforms.functional.gaussian_blur(x, kernel_size=self.kernel_size, sigma=self.sigma)
+        x = x - lf_x
+        x = x.permute(0, 2, 3, 1).view(N, T, H, W, -1)
+        return x
+
+
 """
 Advanced Layers
 """
@@ -99,6 +142,22 @@ class Conv2dBlock(nn.Module):
     def forward(self, input):
         x = self.conv(self.norm(input)) if self.norm_first else self.norm(self.conv(input))
         x = self.act(x)
+        return x
+
+
+class ConvDepthsBlock(nn.Module):
+    def __init__(self, in_features: int, out_features: int, kernel_size=3, depths=1,
+                 act='gelu', norm='layernorm', bias: bool = True, norm_first=False):
+        super().__init__()
+        self.layers = nn.ModuleList()
+
+        for _ in range(depths):
+            self.layers.append(Conv2dBlock(in_features=in_features, out_features=out_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, norm_first=norm_first))
+
+    def forward(self, input):
+        x = input
+        for layer in self.layers:
+            x = layer(x)
         return x
 
 
@@ -220,7 +279,7 @@ class GridTrilinear3D(nn.Module):
     """
     The module for mapping feature maps to a fixed size with trilinear interpolation.
     """
-    def __init__(self, output_size, align_corners=False):
+    def __init__(self, output_size, align_corners=True):
         super().__init__()
         self.output_size = output_size
         self.align_corners = align_corners
@@ -239,7 +298,7 @@ class GridUpsample(nn.Module):
     """
     The module for mapping feature maps to a fixed size with trilinear interpolation.
     """
-    def __init__(self, output_size, align_corners=False):
+    def __init__(self, output_size, align_corners=True):
         super().__init__()
         self.output_size = output_size
         self.align_corners = align_corners
@@ -495,6 +554,175 @@ class MATBlock4(nn.Module):
         return x, m_out
 
 
+class MATBlock4_2(nn.Module):
+    """
+    conv (d) --> rMAT (x + (1+mask) * t_x) --> conv (1) 
+    """
+    def __init__(self, in_features: int, out_features: int, hidden_features: int,
+                           kernel_size=3, act='gelu', norm='layernorm', bias: bool=True,
+                           layerscale_init=0., dropout=0., droppath=0., depths=2,
+                           mat_dimension=(600, 8)):
+        super().__init__()
+        # Affine Transform
+        in_dim = mat_dimension[1]
+        self.gammas = nn.Parameter(nn.init.uniform_(torch.empty(mat_dimension, dtype=torch.float32), -1e-3, 1e-3), requires_grad=True)
+        self.betas = nn.Parameter(nn.init.uniform_(torch.empty(mat_dimension, dtype=torch.float32), -1e-3, 1e-3), requires_grad=True)
+        self.g_linear = nn.Linear(in_dim, out_features)
+        self.b_linear = nn.Linear(in_dim, out_features)
+
+        self.conv1, self.conv2 = [nn.ModuleList() for _ in range(2)]
+        for i in range(depths):
+            self.conv1.append(ConvNeXtBlock(in_features=in_features if i==0 else out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
+        self.conv2.append(ConvNeXtBlock(in_features=out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
+
+        self.mask_conv = nn.Sequential(
+            Conv2d(out_features, out_features, kernel_size=3, padding='same', groups=out_features),
+            nn.ReLU(inplace=True),
+            Conv2d(out_features, 1, kernel_size=1, padding='same'),
+            nn.Sigmoid(),
+        )
+        self._initialize_maskconv()
+
+    def _initialize_maskconv(self):
+        laplacian = torch.tensor([[-1., -1., -1.],
+                                            [-1., 8., -1.],
+                                            [-1., -1., -1.]], dtype=torch.float32)
+        with torch.no_grad():
+            for i in range(self.mask_conv[0].weight.shape[0]):
+                self.mask_conv[0].weight[i, 0, :, :] = laplacian
+            
+            nn.init.constant_(self.mask_conv[2].weight, 1.0 / self.mask_conv[2].in_channels)
+
+    def forward(self, idx: torch.IntTensor, x: torch.Tensor, mask=None):
+        """
+        idx: t-index. [N, T]
+        """
+        for layer1 in self.conv1:
+            x = layer1(x, mask)
+
+        # masked affine transform
+        m_out = self.mask_conv(x)
+        gamma = self.g_linear(self.gammas[idx])             # [N, T, C]
+        beta = self.b_linear(self.betas[idx])                       # [N, T, C]
+        t_x = x * gamma[:, :, None, None, :] + beta[:, :, None, None, :]
+
+        x = x + t_x * (1 + m_out)
+
+        for layer2 in self.conv2:
+            x = layer2(x, mask)
+
+        return x, m_out
+
+
+class MATBlock4_3(nn.Module):
+    """
+    conv (d) --> rMAT (x + (1+mask) * t_x) --> conv (d) 
+    """
+    def __init__(self, in_features: int, out_features: int, hidden_features: int,
+                           kernel_size=3, act='gelu', norm='layernorm', bias: bool=True,
+                           layerscale_init=0., dropout=0., droppath=0., depths=2,
+                           mat_dimension=(600, 8)):
+        super().__init__()
+        # Affine Transform
+        in_dim = mat_dimension[1]
+        self.gammas = nn.Parameter(nn.init.uniform_(torch.empty(mat_dimension, dtype=torch.float32), -1e-3, 1e-3), requires_grad=True)
+        self.betas = nn.Parameter(nn.init.uniform_(torch.empty(mat_dimension, dtype=torch.float32), -1e-3, 1e-3), requires_grad=True)
+        self.g_linear = nn.Linear(in_dim, out_features)
+        self.b_linear = nn.Linear(in_dim, out_features)
+
+        self.conv1, self.conv2 = [nn.ModuleList() for _ in range(2)]
+        for i in range(depths):
+            self.conv1.append(ConvNeXtBlock(in_features=in_features if i==0 else out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
+            self.conv2.append(ConvNeXtBlock(in_features=out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
+
+        self.mask_conv = nn.Sequential(
+            Conv2d(out_features, out_features, kernel_size=3, padding='same', groups=out_features),
+            nn.ReLU(inplace=True),
+            Conv2d(out_features, 1, kernel_size=1, padding='same'),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, idx: torch.IntTensor, x: torch.Tensor, mask=None):
+        """
+        idx: t-index. [N, T]
+        """
+        for layer1 in self.conv1:
+            x = layer1(x, mask)
+
+        # masked affine transform
+        m_out = self.mask_conv(x)
+        gamma = self.g_linear(self.gammas[idx])             # [N, T, C]
+        beta = self.b_linear(self.betas[idx])                       # [N, T, C]
+        t_x = x * gamma[:, :, None, None, :] + beta[:, :, None, None, :]
+
+        x = x + t_x * (1 + m_out)
+
+        for layer2 in self.conv2:
+            x = layer2(x, mask)
+
+        return x, m_out
+
+
+class MATBlock4_4(nn.Module):
+    """
+    conv (d) --> MAT (x + mask * t_x) --> conv (d) 
+    """
+    def __init__(self, in_features: int, out_features: int, hidden_features: int,
+                           kernel_size=3, act='gelu', norm='layernorm', bias: bool=True,
+                           layerscale_init=0., dropout=0., droppath=0., depths=2,
+                           mat_dimension=(600, 8)):
+        super().__init__()
+        # Affine Transform
+        in_dim = mat_dimension[1]
+        self.gammas = nn.Parameter(nn.init.uniform_(torch.empty(mat_dimension, dtype=torch.float32), -1e-3, 1e-3), requires_grad=True)
+        self.betas = nn.Parameter(nn.init.uniform_(torch.empty(mat_dimension, dtype=torch.float32), -1e-3, 1e-3), requires_grad=True)
+        self.g_linear = nn.Linear(in_dim, out_features)
+        self.b_linear = nn.Linear(in_dim, out_features)
+
+        self.conv1, self.conv2 = [nn.ModuleList() for _ in range(2)]
+        for i in range(depths):
+            self.conv1.append(ConvNeXtBlock(in_features=in_features if i==0 else out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
+            self.conv2.append(ConvNeXtBlock(in_features=out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
+
+        self.mask_conv = nn.Sequential(
+            Conv2d(out_features, out_features, kernel_size=3, padding='same', groups=out_features),
+            nn.ReLU(inplace=True),
+            Conv2d(out_features, 1, kernel_size=1, padding='same'),
+            nn.Tanh(),
+        )
+        self._initialize_maskconv()
+
+    def _initialize_maskconv(self):
+        laplacian = torch.tensor([[-1., -1., -1.],
+                                            [-1., 8., -1.],
+                                            [-1., -1., -1.]], dtype=torch.float32)
+        with torch.no_grad():
+            for i in range(self.mask_conv[0].weight.shape[0]):
+                self.mask_conv[0].weight[i, 0, :, :] = laplacian
+            
+            nn.init.constant_(self.mask_conv[2].weight, 1.0 / self.mask_conv[2].in_channels)
+
+    def forward(self, idx: torch.IntTensor, x: torch.Tensor, mask=None):
+        """
+        idx: t-index. [N, T]
+        """
+        for layer1 in self.conv1:
+            x = layer1(x, mask)
+
+        # masked affine transform
+        m_out = self.mask_conv(x)
+        gamma = self.g_linear(self.gammas[idx])             # [N, T, C]
+        beta = self.b_linear(self.betas[idx])                       # [N, T, C]
+        t_x = x * gamma[:, :, None, None, :] + beta[:, :, None, None, :]
+
+        x = x + t_x * m_out
+
+        for layer2 in self.conv2:
+            x = layer2(x, mask)
+
+        return x, m_out
+
+
 class MATBlock5(nn.Module):
     """
     conv (d) --> rMAT (x + (1+mask) * t_x) --> conv (d) 
@@ -718,6 +946,56 @@ class MMBlock(nn.Module):
 
         for layer2 in self.conv2:
             x = layer2(x, mask)
+        return x, m_out
+
+
+class MMBlock2(nn.Module):
+    """
+    conv (d) --> rMM (x + mask * x) --> conv (d) 
+    """
+    def __init__(self, in_features: int, out_features: int, hidden_features: int,
+                           kernel_size=3, act='gelu', norm='layernorm', bias: bool=True,
+                           layerscale_init=0., dropout=0., droppath=0., depths=2,
+                           mat_dimension=(600, 8)):
+        super().__init__()
+
+        self.conv1, self.conv2 = [nn.ModuleList() for _ in range(2)]
+        for i in range(depths):
+            self.conv1.append(ConvNeXtBlock(in_features=in_features if i==0 else out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
+            self.conv2.append(ConvNeXtBlock(in_features=out_features, out_features=out_features, hidden_features=hidden_features, kernel_size=kernel_size, act=act, norm=norm, bias=bias, layerscale_init=layerscale_init, dropout=dropout, droppath=droppath))
+
+        self.mask_conv = nn.Sequential(
+            Conv2d(out_features, out_features, kernel_size=3, padding='same', groups=out_features),
+            nn.ReLU(inplace=True),
+            Conv2d(out_features, 1, kernel_size=1, padding='same'),
+            nn.Sigmoid(),
+        )
+        self._initialize_maskconv()
+
+    def _initialize_maskconv(self):
+        laplacian = torch.tensor([[-1., -1., -1.],
+                                            [-1., 8., -1.],
+                                            [-1., -1., -1.]], dtype=torch.float32)
+        with torch.no_grad():
+            for i in range(self.mask_conv[0].weight.shape[0]):
+                self.mask_conv[0].weight[i, 0, :, :] = laplacian
+            
+            nn.init.constant_(self.mask_conv[2].weight, 1.0 / self.mask_conv[2].in_channels)
+
+    def forward(self, idx: torch.IntTensor, x: torch.Tensor, mask=None):
+        """
+        idx: t-index. [N, T]
+        """
+        for layer1 in self.conv1:
+            x = layer1(x, mask)
+
+        # masked affine transform
+        m_out = self.mask_conv(x)
+        x = x * (1 + m_out)
+
+        for layer2 in self.conv2:
+            x = layer2(x, mask)
+
         return x, m_out
 
 
@@ -1109,6 +1387,9 @@ def get_block(type, **kwargs):
     elif type == 'conv_stem':
         return Conv2dBlock(in_features=kwargs['C1'], out_features=kwargs['C2'], kernel_size=kwargs['kernel_size'],
                            act=kwargs['act'], norm=kwargs['norm'], norm_first=False, bias=kwargs['bias'])
+    elif type == 'conv_block':
+        return ConvDepthsBlock(in_features=kwargs['C1'], out_features=kwargs['C2'], kernel_size=kwargs['kernel_size'], depths=kwargs['depths'],
+                            act = kwargs['act'], norm=kwargs['norm'], norm_first=False, bias=kwargs['bias'])
     elif type == 'linear_head':
         return LinearBlock(in_features=kwargs['C1'], out_features=kwargs['C2'],
                            act=kwargs['act'], norm=kwargs['norm'], norm_first=True, bias=kwargs['bias'])
@@ -1150,6 +1431,12 @@ def get_block(type, **kwargs):
                             depths=kwargs['depths'], mat_dimension=kwargs['mat_dim'])
     elif type == 'mmblock':
         return MMBlock(in_features=kwargs['C1'], out_features=kwargs['C2'], hidden_features=kwargs['Ch'],
+                            kernel_size=kwargs['kernel_size'], act=kwargs['act'],
+                            norm=kwargs['norm'], bias=kwargs['bias'],
+                            layerscale_init=kwargs['layerscale'], dropout=kwargs['dropout'], 
+                            droppath=kwargs['droppath'], depths=kwargs['depths'])
+    elif type == 'mmblock2':
+        return MMBlock2(in_features=kwargs['C1'], out_features=kwargs['C2'], hidden_features=kwargs['Ch'],
                             kernel_size=kwargs['kernel_size'], act=kwargs['act'],
                             norm=kwargs['norm'], bias=kwargs['bias'],
                             layerscale_init=kwargs['layerscale'], dropout=kwargs['dropout'], 
@@ -1202,6 +1489,27 @@ def get_block(type, **kwargs):
                             depths=kwargs['depths'], mat_dimension=kwargs['mat_dim'])
     elif type == 'matblock4':
         return MATBlock4(in_features=kwargs['C1'], out_features=kwargs['C2'], hidden_features=kwargs['Ch'],
+                            kernel_size=kwargs['kernel_size'], act=kwargs['act'],
+                            norm=kwargs['norm'], bias=kwargs['bias'],
+                            layerscale_init=kwargs['layerscale'],
+                            dropout=kwargs['dropout'], droppath=kwargs['droppath'],
+                            depths=kwargs['depths'], mat_dimension=kwargs['mat_dim'])
+    elif type == 'matblock4_2':
+        return MATBlock4_2(in_features=kwargs['C1'], out_features=kwargs['C2'], hidden_features=kwargs['Ch'],
+                            kernel_size=kwargs['kernel_size'], act=kwargs['act'],
+                            norm=kwargs['norm'], bias=kwargs['bias'],
+                            layerscale_init=kwargs['layerscale'],
+                            dropout=kwargs['dropout'], droppath=kwargs['droppath'],
+                            depths=kwargs['depths'], mat_dimension=kwargs['mat_dim'])
+    elif type == 'matblock4_3':
+        return MATBlock4_3(in_features=kwargs['C1'], out_features=kwargs['C2'], hidden_features=kwargs['Ch'],
+                            kernel_size=kwargs['kernel_size'], act=kwargs['act'],
+                            norm=kwargs['norm'], bias=kwargs['bias'],
+                            layerscale_init=kwargs['layerscale'],
+                            dropout=kwargs['dropout'], droppath=kwargs['droppath'],
+                            depths=kwargs['depths'], mat_dimension=kwargs['mat_dim'])
+    elif type == 'matblock4_4':
+        return MATBlock4_4(in_features=kwargs['C1'], out_features=kwargs['C2'], hidden_features=kwargs['Ch'],
                             kernel_size=kwargs['kernel_size'], act=kwargs['act'],
                             norm=kwargs['norm'], bias=kwargs['bias'],
                             layerscale_init=kwargs['layerscale'],
